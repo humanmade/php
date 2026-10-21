@@ -44,8 +44,9 @@ The workflow runs only in `humanmade/php` on `master`. Each architecture is buil
 on a native runner and checked for the exact PHP version, valid FPM configuration,
 and required bundled extensions. Architecture images are pushed to both registries
 by digest after testing, with the same source label applied to the tested and
-pushed builds. The workflow checks the pushed image config against the tested
-image. Only after all builds pass are combined multi-platform tags created in each
+pushed builds. The workflow reads each registry's runtime manifest (resolving any
+OCI index containing provenance attestations) and checks its image config against
+the tested image. Only after all builds pass are combined multi-platform tags created in each
 registry, using its own digest references. A registry failure fails the run; tag
 updates across registries are not atomic, so check both before retrying.
 

@@ -120,12 +120,13 @@ jobs:
           cache-to: type=gha,mode=max,scope=php-${{ matrix.version }}-${{ inputs.suite }}-${{ matrix.arch }}
       - name: Verify pushed image matches tested image
         env:
-          BUILD_METADATA: ${{ steps.push.outputs.metadata }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          tested=$(docker image inspect php-test:local --format '{{.Id}}')
-          pushed=$(jq -er '.["containerimage.config.digest"]' <<< "$BUILD_METADATA")
-          test "$tested" = "$pushed"
+          for registry in docker.io ghcr.io; do
+            bash .github/scripts/verify-pushed-image.sh "$registry/$IMAGE@$DIGEST" "$ARCH" php-test:local
+          done
       - name: Record digest
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
