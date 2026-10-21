@@ -107,6 +107,14 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-to: type=gha,mode=max,scope=php-${{ matrix.version }}-${{ inputs.suite }}-${{ matrix.arch }}
+      - name: Verify pushed image matches tested image
+        env:
+          BUILD_METADATA: ${{ steps.push.outputs.metadata }}
+        run: |
+          set -euo pipefail
+          tested=$(docker image inspect php-test:local --format '{{.Id}}')
+          pushed=$(jq -er '.["containerimage.config.digest"]' <<< "$BUILD_METADATA")
+          test "$tested" = "$pushed"
       - name: Record digest
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
