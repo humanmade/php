@@ -1,0 +1,162 @@
+name: Publish to Docker Hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      php-version:
+        description: PHP release series to publish
+        type: choice
+        default: all
+        options: [all, '8.2', '8.3', '8.4', '8.5']
+      suite:
+        description: Debian release for the FPM images
+        type: choice
+        default: trixie
+        options: [trixie, bookworm]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ inputs.suite }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: humanmade/php
+
+jobs:
+  prepare:
+    if: github.repository == 'humanmade/php' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    outputs:
+      versions: ${{ steps.matrix.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select stable versions
+        id: matrix
+        env:
+          PHP_SERIES: ${{ inputs.php-version }}
+          SUITE: ${{ inputs.suite }}
+        run: |
+          set -euo pipefail
+          versions=$(jq -ce --arg series "$PHP_SERIES" --arg variant "$SUITE/fpm" '
+            [to_entries[]
+              | select(.key | test("^8\\.[2-5]$"))
+              | select($series == "all" or .key == $series)
+              | select(.value.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+              | select(.value.variants | index($variant))
+              | .key]
+            | if length > 0 then . else error("No matching stable FPM versions") end
+          ' versions.json)
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.prepare.outputs.versions) }}
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Build for testing
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.version }}/${{ inputs.suite }}/fpm
+          platforms: linux/${{ matrix.arch }}
+          pull: true
+          load: true
+          tags: php-test:local
+          cache-from: type=gha,scope=php-${{ matrix.version }}-${{ inputs.suite }}-${{ matrix.arch }}
+      - name: Test PHP and FPM
+        env:
+          PHP_SERIES: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          expected=$(jq -r --arg series "$PHP_SERIES" '.[$series].version' versions.json)
+          actual=$(docker run --rm php-test:local php -r 'echo PHP_VERSION;')
+          test "$actual" = "$expected"
+          docker run --rm php-test:local php-fpm -t
+          docker run --rm php-test:local php -r '
+            foreach (["curl", "mbstring", "mysqlnd", "openssl", "pdo_sqlite", "sodium"] as $extension) {
+              if (!extension_loaded($extension)) {
+                fwrite(STDERR, "Missing extension: $extension\n");
+                exit(1);
+              }
+            }
+          '
+      # Reuse the tested build's local BuildKit cache; publish by digest only.
+      # Public version tags are created after every matrix build has passed.
+      - name: Push tested image by digest
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.version }}/${{ inputs.suite }}/fpm
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-to: type=gha,mode=max,scope=php-${{ matrix.version }}-${{ inputs.suite }}-${{ matrix.arch }}
+      - name: Record digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.version }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [prepare, build]
+    strategy:
+      matrix:
+        version: ${{ fromJson(needs.prepare.outputs.versions) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.version }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Publish multi-platform tags
+        env:
+          PHP_SERIES: ${{ matrix.version }}
+          SUITE: ${{ inputs.suite }}
+          DIGEST_DIR: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          version=$(jq -r --arg series "$PHP_SERIES" '.[$series].version' versions.json)
+          sources=()
+          for file in "$DIGEST_DIR"/*; do
+            digest=${file##*/}
+            [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
+            sources+=("$IMAGE@sha256:$digest")
+          done
+          test "${#sources[@]}" -eq 2
+          docker buildx imagetools create \
+            --tag "$IMAGE:$version-fpm-$SUITE" \
+            --tag "$IMAGE:$PHP_SERIES-fpm-$SUITE" \
+            "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$version-fpm-$SUITE"
+          echo "Published \`$IMAGE:$version-fpm-$SUITE\` and \`$IMAGE:$PHP_SERIES-fpm-$SUITE\` (AMD64 + ARM64)." >> "$GITHUB_STEP_SUMMARY"
